@@ -90,19 +90,22 @@ class Logger:
             self.fh.close()
 
 
-async def pump(reader, writer, direction, log, on_data=None):
-    """Copy one direction, logging every chunk, until EOF."""
+async def pump(reader, writer, direction, log, filt=None):
+    """Copy one direction until EOF. `filt(direction, data)` -> log this chunk?
+    (it also parses state as a side effect). Relay happens regardless."""
     try:
         while True:
             data = await reader.read(65536)
             if not data:
                 break
-            log.frame(direction, data)
-            if on_data is not None:
+            show = True
+            if filt is not None:
                 try:
-                    on_data(data)
-                except Exception:  # noqa: BLE001 - parsing must never break the relay
-                    pass
+                    show = filt(direction, data)
+                except Exception:  # noqa: BLE001 - never break the relay
+                    show = True
+            if show:
+                log.frame(direction, data)
             writer.write(data)
             await writer.drain()
     except (ConnectionResetError, BrokenPipeError, ssl.SSLError) as e:
@@ -169,8 +172,8 @@ class Proxy:
             c_writer.close(); log.close(); return
 
         await asyncio.gather(
-            pump(c_reader, u_writer, "C>S", log, on_data=self._parse_status),
-            pump(u_reader, c_writer, "S>C", log),
+            pump(c_reader, u_writer, "C>S", log, filt=self._filter),
+            pump(u_reader, c_writer, "S>C", log, filt=self._filter),
         )
 
         for w in (c_writer, u_writer):
@@ -184,7 +187,23 @@ class Proxy:
         log.line("connection closed")
         log.close()
 
-    # ---- status parsing -----------------------------------------------------
+    # ---- frame filtering + status parsing -----------------------------------
+    def _filter(self, direction, data):
+        """Parse state (side effect); return True if this chunk should be logged.
+        Routine polls/heartbeats/status frames are suppressed to keep the log
+        focused on real commands even when polling fast."""
+        self._parse_status(data)
+        return not self._is_routine(data)
+
+    @staticmethod
+    def _is_routine(d):
+        # 68 | addr[6] | 86 | ctrl(8) | len(9) | ...
+        if len(d) < 10 or d[0] != 0x68 or d[7] != 0x86:
+            return False
+        ctrl, ln = d[8], d[9]
+        # 00=server poll, (80,0b)=heartbeat, (82,51)=status dump, (02,0c)=status query
+        return ctrl == 0x00 or (ctrl, ln) in {(0x80, 0x0b), (0x82, 0x51), (0x02, 0x0c)}
+
     def _parse_status(self, data: bytes):
         """Extract device state from a 93-byte status dump (control 86 82 51).
         byte 18 (relative to the 0x68 frame start) = power: 01=on, 00=off."""
@@ -193,12 +212,16 @@ class Proxy:
             return
         frame_start = idx - 7
         power = data[idx + 11]
+        prev = self.state.get("power_on")
         self.state = {
             "power_on": bool(power),
             "power_raw": power,
             "updated": ts(),
             "raw": data[frame_start:frame_start + 93].hex(),
         }
+        if prev is not None and prev != bool(power):
+            print(f"[{ts()}] [state] power {'on' if prev else 'off'} -> "
+                  f"{'on' if power else 'off'}", flush=True)
 
     # ---- periodic status poll ----------------------------------------------
     async def poller(self):
@@ -248,7 +271,8 @@ class Proxy:
                        "have_cmd_on": bool(self.cmd_on),
                        "have_cmd_off": bool(self.cmd_off),
                        "power_on": self.state["power_on"],
-                       "state_updated": self.state["updated"]}
+                       "state_updated": self.state["updated"],
+                       "raw": self.state.get("raw")}
         elif u.path in ("/on", "/off"):
             frame = self.cmd_on if u.path == "/on" else self.cmd_off
             if not frame:
