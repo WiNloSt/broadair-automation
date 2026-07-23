@@ -2,12 +2,12 @@
 # `image` is set, so HA PULLS this prebuilt image from GHCR (it does NOT build
 # on the device). The {arch} placeholder is replaced with the host's arch, and
 # HA pulls `<image>:<version>` — so the CI must publish that arch/version tag.
-name: Broad Air TLS Proxy
+name: Broad Air Capture Proxy
 version: "1.0.1"
 slug: broadair_proxy
 description: >-
-  TLS-terminating MITM proxy that captures/relays the Broad "Fresh Lung"
-  purifier's cloud frames (Phase 1). Log tab shows frames live.
+  Raw TCP relay that captures the Broad "Fresh Lung" purifier module's serial
+  frames (broadair.remotcon.mobi:18013). Log tab shows frames live.
 url: https://github.com/WiNloSt/broadair-automation
 # GHCR namespace is your GitHub owner, lowercased. Change if you fork/rename.
 image: "ghcr.io/winlost/broadair-proxy-{arch}"
@@ -18,21 +18,23 @@ arch:
 init: false
 startup: services
 boot: auto
-# The module's Server Port is baked in as 8103; we must listen there.
+# The module connects to its Server Port 18013; we listen there and relay.
 ports:
-  8103/tcp: 8103
+  18013/tcp: 18013
 ports_description:
-  8103/tcp: TLS port the Broad WiFi module connects to (matches broadcleanair.net:8103)
+  18013/tcp: Raw TCP port the Broad WiFi module connects to (broadair.remotcon.mobi:18013)
 # Persistent hex-frame logs land in /share/broadair-proxy (browsable via Samba).
 map:
   - share:rw
 options:
+  mode: raw
+  listen_port: 18013
   upstream_ip: "47.110.148.39"
-  upstream_port: 8103
-  upstream_sni: "broadcleanair.net"
-  verify_upstream: false
+  upstream_port: 18013
+  upstream_sni: "broadair.remotcon.mobi"
 schema:
+  mode: list(raw|tls)
+  listen_port: port
   upstream_ip: str
   upstream_port: port
   upstream_sni: str
-  verify_upstream: bool

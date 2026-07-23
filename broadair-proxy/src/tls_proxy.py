@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """
-TLS-terminating MITM proxy for the Broad "Fresh Lung" purifier.
+MITM capture proxy for the Broad "Fresh Lung" purifier.
 
-Phase 1: the Hi-Flying WiFi module is a transparent serial<->TCP
-bridge that connects out over TLS to broadcleanair.net:8103. This proxy sits in
-the middle so we can read the plaintext command/status frames:
+The Hi-Flying WiFi module is a transparent serial<->TCP bridge. Recon showed its
+real Server Address is `broadair.remotcon.mobi:18013` (NOT broadcleanair.net:8103
+-- that host is only the app/HA REST API). The module endpoint speaks a **raw
+TCP** binary frame protocol (0x68 header ... 0x16 terminator), no TLS.
 
-    [module] --TLS--> [this proxy] --TLS--> [broadcleanair.net:8103]
-                          |
-                    hex-logs both directions
+This proxy sits in the middle so we can read those frames:
 
-The module leg is terminated with a self-signed cert (see gen_cert.sh). The
-make-or-break question is whether the module validates that
-cert. If it does, the handshake on the module side fails and we fall back to
-UART capture; this proxy logs that failure clearly so you know which case you hit.
+    [module] --raw TCP--> [this proxy] --raw TCP--> [broadair.remotcon.mobi:18013]
+                              |
+                        hex-logs both directions
+
+Two modes:
+  --mode raw  (default): plain TCP relay, for the module endpoint (:18013).
+  --mode tls           : TLS-terminating MITM (self-signed cert), kept for the
+                         REST endpoint / future use.
 
 NOTHING here changes any server, router, or module config. Redirecting the
-module's traffic to this proxy (DNS override or Server Address change) is a
-separate, manual step you perform when you're ready.
+module's traffic to this proxy (DNS rewrite of broadair.remotcon.mobi, or a
+Server Address change on the module) is a separate, manual step.
 """
 
 import argparse
@@ -28,13 +31,13 @@ import sys
 from datetime import datetime, timezone
 
 # --- Recon defaults (resolved 2026-07-23) ----------------------------------
-# Resolve the REAL upstream IP before any DNS override exists; if you point
-# broadcleanair.net at this proxy, DNS can no longer find the real server, so we
-# dial its IP directly and present the hostname via SNI.
-DEFAULT_UPSTREAM_IP = "47.110.148.39"
-DEFAULT_UPSTREAM_SNI = "broadcleanair.net"
-DEFAULT_UPSTREAM_PORT = 8103
-DEFAULT_LISTEN_PORT = 8103
+# The REAL module upstream, pinned by IP so a DNS rewrite of the hostname can't
+# make the proxy resolve back to itself.
+DEFAULT_MODE = "raw"
+DEFAULT_UPSTREAM_IP = "47.110.148.39"          # broadair.remotcon.mobi
+DEFAULT_UPSTREAM_SNI = "broadair.remotcon.mobi"  # only used in --mode tls
+DEFAULT_UPSTREAM_PORT = 18013
+DEFAULT_LISTEN_PORT = 18013
 
 
 def ts() -> str:
@@ -114,23 +117,26 @@ class Proxy:
     def __init__(self, args):
         self.args = args
         self._counter = 0
-        # --- Downstream (module -> us): present our self-signed cert ---
-        self.server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        self.server_ctx.load_cert_chain(args.cert, args.key)
-        # --- Upstream (us -> real cloud) ---
-        self.client_ctx = ssl.create_default_context()
-        if not args.verify_upstream:
-            # Robust default: the real cert is valid, but we dial by IP with SNI
-            # and don't want a hostname/verify hiccup to break capture.
-            self.client_ctx.check_hostname = False
-            self.client_ctx.verify_mode = ssl.CERT_NONE
+        self.mode = args.mode
+        self.server_ctx = None
+        self.client_ctx = None
+        if self.mode == "tls":
+            # Downstream (module -> us): present our self-signed cert.
+            self.server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            self.server_ctx.load_cert_chain(args.cert, args.key)
+            # Upstream (us -> real cloud).
+            self.client_ctx = ssl.create_default_context()
+            if not args.verify_upstream:
+                self.client_ctx.check_hostname = False
+                self.client_ctx.verify_mode = ssl.CERT_NONE
+        # raw mode: both contexts stay None -> plain TCP both legs.
 
     async def handle(self, c_reader, c_writer):
         self._counter += 1
         peer = c_writer.get_extra_info("peername")
         conn_id = f"conn{self._counter:04d}_{datetime.now(timezone.utc).strftime('%H%M%S')}"
         log = Logger(conn_id, self.args.log_dir)
-        log.line(f"module connected from {peer}"
+        log.line(f"client connected from {peer}"
                  + (f"  (logging to {log.path})" if log.path else ""))
 
         u_reader = u_writer = None
@@ -140,12 +146,14 @@ class Proxy:
                     self.args.upstream_ip,
                     self.args.upstream_port,
                     ssl=self.client_ctx,
-                    server_hostname=self.args.upstream_sni,
+                    # server_hostname is only valid when ssl is set
+                    server_hostname=self.args.upstream_sni if self.client_ctx else None,
                 ),
                 timeout=15,
             )
+            sni = f" (SNI {self.args.upstream_sni})" if self.client_ctx else ""
             log.line(f"upstream connected -> {self.args.upstream_ip}:"
-                     f"{self.args.upstream_port} (SNI {self.args.upstream_sni})")
+                     f"{self.args.upstream_port}{sni}")
         except Exception as e:  # noqa: BLE001 - want to log any failure mode
             log.line(f"UPSTREAM CONNECT FAILED: {type(e).__name__}: {e}")
             c_writer.close()
@@ -170,15 +178,15 @@ class Proxy:
             self.handle,
             self.args.listen_host,
             self.args.listen_port,
-            ssl=self.server_ctx,
+            ssl=self.server_ctx,   # None in raw mode -> plain TCP listener
         )
         addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
-        print(f"[{ts()}] TLS MITM proxy listening on {addrs}", flush=True)
+        kind = "TLS-terminating MITM" if self.mode == "tls" else "raw TCP relay"
+        print(f"[{ts()}] {kind} listening on {addrs}", flush=True)
         print(f"[{ts()}] forwarding -> {self.args.upstream_ip}:"
-              f"{self.args.upstream_port} (SNI {self.args.upstream_sni}, "
-              f"verify={'on' if self.args.verify_upstream else 'off'})", flush=True)
+              f"{self.args.upstream_port} (mode={self.mode})", flush=True)
         print(f"[{ts()}] NOTE: nothing is redirected yet. Point the module here "
-              f"only when you're ready (DNS override or Server Address).", flush=True)
+              f"only when you're ready (DNS rewrite or Server Address).", flush=True)
         async with server:
             await server.serve_forever()
 
@@ -187,6 +195,9 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     here = os.path.dirname(os.path.abspath(__file__))
+    p.add_argument("--mode", choices=["raw", "tls"],
+                   default=os.environ.get("PROXY_MODE", DEFAULT_MODE),
+                   help="raw TCP relay (module endpoint) or TLS-terminating MITM")
     p.add_argument("--listen-host", default=os.environ.get("PROXY_LISTEN_HOST", "0.0.0.0"))
     p.add_argument("--listen-port", type=int,
                    default=int(os.environ.get("PROXY_LISTEN_PORT", DEFAULT_LISTEN_PORT)))
@@ -198,14 +209,14 @@ def parse_args(argv=None):
     p.add_argument("--key", default=os.environ.get("PROXY_KEY", os.path.join(here, "certs", "proxy.key")))
     p.add_argument("--log-dir", default=os.environ.get("PROXY_LOG_DIR", os.path.join(here, "logs")))
     p.add_argument("--verify-upstream", action="store_true",
-                   help="verify the real broadcleanair.net cert (off by default)")
+                   help="(tls mode) verify the real upstream cert (off by default)")
     return p.parse_args(argv)
 
 
 def main():
     args = parse_args()
-    if not (os.path.exists(args.cert) and os.path.exists(args.key)):
-        sys.exit(f"missing cert/key ({args.cert} / {args.key}); run gen_cert.sh first")
+    if args.mode == "tls" and not (os.path.exists(args.cert) and os.path.exists(args.key)):
+        sys.exit(f"tls mode needs cert/key ({args.cert} / {args.key}); run gen_cert.sh first")
     try:
         asyncio.run(Proxy(args).run())
     except KeyboardInterrupt:

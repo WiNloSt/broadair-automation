@@ -4,8 +4,9 @@ Local control for the Broad "Fresh Lung" air purifier, without depending on the
 `broadcleanair.net` cloud.
 
 This repo is a **Home Assistant add-on repository**. The `broadair-proxy` add-on
-is a TLS-terminating MITM proxy that captures the purifier's cloud frames so the
-serial protocol can be decoded and replayed locally.
+is a raw TCP relay that captures the purifier module's serial frames
+(`broadair.remotcon.mobi:18013`) so the protocol can be decoded and replayed
+locally.
 
 ## Layout
 
