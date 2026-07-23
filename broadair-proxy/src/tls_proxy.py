@@ -90,7 +90,7 @@ class Logger:
             self.fh.close()
 
 
-async def pump(reader, writer, direction, log, on_module_bytes=None):
+async def pump(reader, writer, direction, log, on_data=None):
     """Copy one direction, logging every chunk, until EOF."""
     try:
         while True:
@@ -98,6 +98,11 @@ async def pump(reader, writer, direction, log, on_module_bytes=None):
             if not data:
                 break
             log.frame(direction, data)
+            if on_data is not None:
+                try:
+                    on_data(data)
+                except Exception:  # noqa: BLE001 - parsing must never break the relay
+                    pass
             writer.write(data)
             await writer.drain()
     except (ConnectionResetError, BrokenPipeError, ssl.SSLError) as e:
@@ -117,11 +122,15 @@ class Proxy:
         self.control_port = args.control_port
         self.cmd_on = parse_hex(args.cmd_on)
         self.cmd_off = parse_hex(args.cmd_off)
+        self.status_query = parse_hex(args.status_query)
+        self.poll_interval = args.poll_interval
         # active module connection (writer toward the module) + write lock
         self.module_writer = None
         self.module_peer = None
         self.module_lock = asyncio.Lock()
         self.ctrl_log = Logger("control", args.log_dir)
+        # parsed device state (from the 93-byte status dump)
+        self.state = {"power_on": None, "updated": None, "raw": None}
 
         self.server_ctx = None
         self.client_ctx = None
@@ -160,7 +169,7 @@ class Proxy:
             c_writer.close(); log.close(); return
 
         await asyncio.gather(
-            pump(c_reader, u_writer, "C>S", log),
+            pump(c_reader, u_writer, "C>S", log, on_data=self._parse_status),
             pump(u_reader, c_writer, "S>C", log),
         )
 
@@ -174,6 +183,37 @@ class Proxy:
             self.module_peer = None
         log.line("connection closed")
         log.close()
+
+    # ---- status parsing -----------------------------------------------------
+    def _parse_status(self, data: bytes):
+        """Extract device state from a 93-byte status dump (control 86 82 51).
+        byte 18 (relative to the 0x68 frame start) = power: 01=on, 00=off."""
+        idx = data.find(b"\x86\x82\x51")   # 86 at frame offset 7 -> byte18 = idx+11
+        if idx < 0 or idx + 11 >= len(data):
+            return
+        frame_start = idx - 7
+        power = data[idx + 11]
+        self.state = {
+            "power_on": bool(power),
+            "power_raw": power,
+            "updated": ts(),
+            "raw": data[frame_start:frame_start + 93].hex(),
+        }
+
+    # ---- periodic status poll ----------------------------------------------
+    async def poller(self):
+        if not self.status_query or self.poll_interval <= 0:
+            return
+        while True:
+            await asyncio.sleep(self.poll_interval)
+            w = self.module_writer
+            if w is not None and not w.is_closing():
+                try:
+                    async with self.module_lock:
+                        w.write(self.status_query)
+                        await w.drain()
+                except OSError:
+                    pass
 
     # ---- injection ----------------------------------------------------------
     async def inject(self, frame: bytes):
@@ -206,7 +246,9 @@ class Proxy:
                        and not self.module_writer.is_closing(),
                        "peer": str(self.module_peer),
                        "have_cmd_on": bool(self.cmd_on),
-                       "have_cmd_off": bool(self.cmd_off)}
+                       "have_cmd_off": bool(self.cmd_off),
+                       "power_on": self.state["power_on"],
+                       "state_updated": self.state["updated"]}
         elif u.path in ("/on", "/off"):
             frame = self.cmd_on if u.path == "/on" else self.cmd_off
             if not frame:
@@ -246,7 +288,9 @@ class Proxy:
         print(f"[{ts()}] forwarding -> {self.args.upstream_ip}:{self.args.upstream_port} (mode={self.mode})", flush=True)
         print(f"[{ts()}] control server on :{self.control_port} "
               f"(/status /on /off /inject?hex=)  cmd_on={'set' if self.cmd_on else 'unset'} "
-              f"cmd_off={'set' if self.cmd_off else 'unset'}", flush=True)
+              f"cmd_off={'set' if self.cmd_off else 'unset'} "
+              f"poll={self.poll_interval if self.status_query else 'off'}s", flush=True)
+        asyncio.create_task(self.poller())
         async with relay, control:
             await asyncio.gather(relay.serve_forever(), control.serve_forever())
 
@@ -264,6 +308,10 @@ def parse_args(argv=None):
     p.add_argument("--upstream-sni", default=env("PROXY_UPSTREAM_SNI", DEFAULT_UPSTREAM_SNI))
     p.add_argument("--cmd-on", default=env("PROXY_CMD_ON", ""), help="hex frame for power ON")
     p.add_argument("--cmd-off", default=env("PROXY_CMD_OFF", ""), help="hex frame for power OFF")
+    p.add_argument("--status-query", default=env("PROXY_STATUS_QUERY", ""),
+                   help="hex frame that asks the device for a status dump")
+    p.add_argument("--poll-interval", type=int, default=int(env("PROXY_POLL_INTERVAL", "30")),
+                   help="seconds between status polls (0 disables)")
     p.add_argument("--cert", default=env("PROXY_CERT", os.path.join(here, "certs", "proxy.crt")))
     p.add_argument("--key", default=env("PROXY_KEY", os.path.join(here, "certs", "proxy.key")))
     p.add_argument("--log-dir", default=env("PROXY_LOG_DIR", os.path.join(here, "logs")))

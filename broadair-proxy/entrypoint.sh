@@ -18,11 +18,14 @@ UPSTREAM_IP="$(opt upstream_ip)";     [ -n "$UPSTREAM_IP" ]   || UPSTREAM_IP="47
 UPSTREAM_PORT="$(opt upstream_port)"; [ -n "$UPSTREAM_PORT" ] || UPSTREAM_PORT="18013"
 CMD_ON="$(opt cmd_on)"
 CMD_OFF="$(opt cmd_off)"
+STATUS_QUERY="$(opt status_query)"
+POLL_INTERVAL="$(opt poll_interval)"; [ -n "$POLL_INTERVAL" ] || POLL_INTERVAL="30"
 
 set -- --mode "$MODE" --listen-host 0.0.0.0 --listen-port "$LISTEN_PORT" \
   --control-port "$CONTROL_PORT" \
   --upstream-ip "$UPSTREAM_IP" --upstream-port "$UPSTREAM_PORT" --log-dir "$LOG_DIR" \
-  --cmd-on "$CMD_ON" --cmd-off "$CMD_OFF"
+  --cmd-on "$CMD_ON" --cmd-off "$CMD_OFF" \
+  --status-query "$STATUS_QUERY" --poll-interval "$POLL_INTERVAL"
 
 # tls mode (optional): mint a self-signed cert on first boot.
 if [ "$MODE" = "tls" ]; then

@@ -37,6 +37,8 @@ options:
   control_port: 8099
   cmd_on: ""
   cmd_off: ""
+  status_query: ""
+  poll_interval: 30
 schema:
   mode: list(raw|tls)
   listen_port: port
@@ -46,3 +48,5 @@ schema:
   control_port: port
   cmd_on: str?
   cmd_off: str?
+  status_query: str?
+  poll_interval: int
