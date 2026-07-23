@@ -3,7 +3,7 @@
 # on the device). The {arch} placeholder is replaced with the host's arch, and
 # HA pulls `<image>:<version>` — so the CI must publish that arch/version tag.
 name: Broad Air TLS Proxy
-version: "1.0.0"
+version: "1.0.1"
 slug: broadair_proxy
 description: >-
   TLS-terminating MITM proxy that captures/relays the Broad "Fresh Lung"
