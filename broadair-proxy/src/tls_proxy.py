@@ -1,43 +1,40 @@
 #!/usr/bin/env python3
 """
-MITM capture proxy for the Broad "Fresh Lung" purifier.
+MITM capture + local-control proxy for the Broad "Fresh Lung" purifier.
 
-The Hi-Flying WiFi module is a transparent serial<->TCP bridge. Recon showed its
-real Server Address is `broadair.remotcon.mobi:18013` (NOT broadcleanair.net:8103
--- that host is only the app/HA REST API). The module endpoint speaks a **raw
-TCP** binary frame protocol (0x68 header ... 0x16 terminator), no TLS.
-
-This proxy sits in the middle so we can read those frames:
+The Hi-Flying WiFi module is a transparent serial<->TCP bridge. Its real Server
+Address is `broadair.remotcon.mobi:18013` (raw TCP, 0x68/0x16 framed) -- NOT
+broadcleanair.net:8103 (that's only the app/HA REST API).
 
     [module] --raw TCP--> [this proxy] --raw TCP--> [broadair.remotcon.mobi:18013]
-                              |
-                        hex-logs both directions
+                              |  \
+                        hex-logs   control server (:8099) — inject command
+                        both dirs  frames straight to the module (local control)
 
-Two modes:
-  --mode raw  (default): plain TCP relay, for the module endpoint (:18013).
-  --mode tls           : TLS-terminating MITM (self-signed cert), kept for the
-                         REST endpoint / future use.
+Because the proxy holds the module's live connection, it can write a captured
+command frame (e.g. power ON/OFF) directly to the module on demand — the module
+obeys, and the cloud/app path keeps working. Command bytes are supplied via
+config (they embed the device MAC), never baked into the image.
 
-NOTHING here changes any server, router, or module config. Redirecting the
-module's traffic to this proxy (DNS rewrite of broadair.remotcon.mobi, or a
-Server Address change on the module) is a separate, manual step.
+Modes: --mode raw (default, module endpoint) | tls (TLS-terminating, REST path).
 """
 
 import argparse
 import asyncio
+import json
 import os
 import ssl
 import sys
 from datetime import datetime, timezone
+from urllib.parse import urlparse, parse_qs
 
 # --- Recon defaults (resolved 2026-07-23) ----------------------------------
-# The REAL module upstream, pinned by IP so a DNS rewrite of the hostname can't
-# make the proxy resolve back to itself.
 DEFAULT_MODE = "raw"
-DEFAULT_UPSTREAM_IP = "47.110.148.39"          # broadair.remotcon.mobi
+DEFAULT_UPSTREAM_IP = "47.110.148.39"            # broadair.remotcon.mobi
 DEFAULT_UPSTREAM_SNI = "broadair.remotcon.mobi"  # only used in --mode tls
 DEFAULT_UPSTREAM_PORT = 18013
 DEFAULT_LISTEN_PORT = 18013
+DEFAULT_CONTROL_PORT = 8099
 
 
 def ts() -> str:
@@ -45,56 +42,55 @@ def ts() -> str:
 
 
 def hexdump(data: bytes, prefix: str = "") -> str:
-    """Classic offset / hex / ascii dump."""
     lines = []
     for off in range(0, len(data), 16):
         chunk = data[off:off + 16]
         hex_part = " ".join(f"{b:02x}" for b in chunk)
-        hex_part = f"{hex_part:<47}"  # 16*3-1 = 47 cols
+        hex_part = f"{hex_part:<47}"
         asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
         lines.append(f"{prefix}{off:08x}  {hex_part}  |{asc}|")
     return "\n".join(lines)
 
 
-class Logger:
-    """Writes to stdout and (optionally) a per-connection file."""
+def parse_hex(s: str) -> bytes:
+    if not s:
+        return b""
+    try:
+        return bytes.fromhex(s.replace(" ", "").replace(":", ""))
+    except ValueError:
+        return b""
 
-    def __init__(self, conn_id: str, log_dir: str | None):
+
+class Logger:
+    def __init__(self, conn_id, log_dir):
         self.conn_id = conn_id
         self.fh = None
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
-            path = os.path.join(log_dir, f"{conn_id}.log")
-            self.fh = open(path, "a", buffering=1)  # line-buffered
-            self.path = path
+            self.path = os.path.join(log_dir, f"{conn_id}.log")
+            self.fh = open(self.path, "a", buffering=1)
         else:
             self.path = None
 
-    def line(self, msg: str) -> None:
+    def line(self, msg):
         out = f"[{ts()}] [{self.conn_id}] {msg}"
         print(out, flush=True)
         if self.fh:
             self.fh.write(out + "\n")
 
-    def frame(self, direction: str, data: bytes) -> None:
-        """direction: 'C>S' (module->cloud) or 'S>C' (cloud->module)."""
+    def frame(self, direction, data):
         head = f"[{ts()}] [{self.conn_id}] {direction} {len(data)} bytes"
         body = hexdump(data)
         print(head + "\n" + body, flush=True)
         if self.fh:
             self.fh.write(head + "\n" + body + "\n")
 
-    def close(self) -> None:
+    def close(self):
         if self.fh:
             self.fh.close()
 
 
-async def pump(
-    reader: asyncio.StreamReader,
-    writer: asyncio.StreamWriter,
-    direction: str,
-    log: Logger,
-) -> None:
+async def pump(reader, writer, direction, log, on_module_bytes=None):
     """Copy one direction, logging every chunk, until EOF."""
     try:
         while True:
@@ -118,19 +114,26 @@ class Proxy:
         self.args = args
         self._counter = 0
         self.mode = args.mode
+        self.control_port = args.control_port
+        self.cmd_on = parse_hex(args.cmd_on)
+        self.cmd_off = parse_hex(args.cmd_off)
+        # active module connection (writer toward the module) + write lock
+        self.module_writer = None
+        self.module_peer = None
+        self.module_lock = asyncio.Lock()
+        self.ctrl_log = Logger("control", args.log_dir)
+
         self.server_ctx = None
         self.client_ctx = None
         if self.mode == "tls":
-            # Downstream (module -> us): present our self-signed cert.
             self.server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             self.server_ctx.load_cert_chain(args.cert, args.key)
-            # Upstream (us -> real cloud).
             self.client_ctx = ssl.create_default_context()
             if not args.verify_upstream:
                 self.client_ctx.check_hostname = False
                 self.client_ctx.verify_mode = ssl.CERT_NONE
-        # raw mode: both contexts stay None -> plain TCP both legs.
 
+    # ---- relay --------------------------------------------------------------
     async def handle(self, c_reader, c_writer):
         self._counter += 1
         peer = c_writer.get_extra_info("peername")
@@ -139,30 +142,26 @@ class Proxy:
         log.line(f"client connected from {peer}"
                  + (f"  (logging to {log.path})" if log.path else ""))
 
-        u_reader = u_writer = None
+        # This connection becomes the injection target (module is the only
+        # persistent client; latest wins).
+        self.module_writer = c_writer
+        self.module_peer = peer
+
         try:
             u_reader, u_writer = await asyncio.wait_for(
                 asyncio.open_connection(
-                    self.args.upstream_ip,
-                    self.args.upstream_port,
+                    self.args.upstream_ip, self.args.upstream_port,
                     ssl=self.client_ctx,
-                    # server_hostname is only valid when ssl is set
                     server_hostname=self.args.upstream_sni if self.client_ctx else None,
-                ),
-                timeout=15,
-            )
-            sni = f" (SNI {self.args.upstream_sni})" if self.client_ctx else ""
-            log.line(f"upstream connected -> {self.args.upstream_ip}:"
-                     f"{self.args.upstream_port}{sni}")
-        except Exception as e:  # noqa: BLE001 - want to log any failure mode
+                ), timeout=15)
+            log.line(f"upstream connected -> {self.args.upstream_ip}:{self.args.upstream_port}")
+        except Exception as e:  # noqa: BLE001
             log.line(f"UPSTREAM CONNECT FAILED: {type(e).__name__}: {e}")
-            c_writer.close()
-            log.close()
-            return
+            c_writer.close(); log.close(); return
 
         await asyncio.gather(
-            pump(c_reader, u_writer, "C>S", log),  # module -> cloud
-            pump(u_reader, c_writer, "S>C", log),  # cloud  -> module
+            pump(c_reader, u_writer, "C>S", log),
+            pump(u_reader, c_writer, "S>C", log),
         )
 
         for w in (c_writer, u_writer):
@@ -170,53 +169,112 @@ class Proxy:
                 w.close()
             except OSError:
                 pass
+        if self.module_writer is c_writer:
+            self.module_writer = None
+            self.module_peer = None
         log.line("connection closed")
         log.close()
 
+    # ---- injection ----------------------------------------------------------
+    async def inject(self, frame: bytes):
+        if not frame:
+            return False, "empty/invalid frame"
+        w = self.module_writer
+        if w is None or w.is_closing():
+            return False, "module not connected"
+        async with self.module_lock:
+            w.write(frame)
+            await w.drain()
+        self.ctrl_log.frame(f"INJECT->module {self.module_peer}", frame)
+        return True, f"sent {len(frame)} bytes to {self.module_peer}"
+
+    # ---- control HTTP server ------------------------------------------------
+    async def handle_control(self, reader, writer):
+        try:
+            req = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=5)
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, asyncio.TimeoutError):
+            writer.close(); return
+        line = req.split(b"\r\n", 1)[0].decode("latin1", "replace")
+        parts = line.split()
+        raw_path = parts[1] if len(parts) >= 2 else "/"
+        u = urlparse(raw_path)
+        q = parse_qs(u.query)
+        status, payload = "200 OK", {}
+
+        if u.path == "/status":
+            payload = {"module_connected": self.module_writer is not None
+                       and not self.module_writer.is_closing(),
+                       "peer": str(self.module_peer),
+                       "have_cmd_on": bool(self.cmd_on),
+                       "have_cmd_off": bool(self.cmd_off)}
+        elif u.path in ("/on", "/off"):
+            frame = self.cmd_on if u.path == "/on" else self.cmd_off
+            if not frame:
+                status, payload = "400 Bad Request", {"ok": False, "detail": f"cmd_{u.path[1:]} not configured"}
+            else:
+                ok, msg = await self.inject(frame)
+                payload = {"ok": ok, "action": u.path[1:], "detail": msg}
+        elif u.path == "/inject":
+            frame = parse_hex(q.get("hex", [""])[0])
+            if not frame:
+                status, payload = "400 Bad Request", {"ok": False, "detail": "bad or missing ?hex="}
+            else:
+                ok, msg = await self.inject(frame)
+                payload = {"ok": ok, "detail": msg}
+        else:
+            status, payload = "404 Not Found", {"ok": False, "detail": "paths: /status /on /off /inject?hex="}
+
+        body = json.dumps(payload)
+        resp = (f"HTTP/1.1 {status}\r\nContent-Type: application/json\r\n"
+                f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n{body}")
+        writer.write(resp.encode())
+        try:
+            await writer.drain()
+        except OSError:
+            pass
+        writer.close()
+
+    # ---- run both servers ---------------------------------------------------
     async def run(self):
-        server = await asyncio.start_server(
-            self.handle,
-            self.args.listen_host,
-            self.args.listen_port,
-            ssl=self.server_ctx,   # None in raw mode -> plain TCP listener
-        )
-        addrs = ", ".join(str(s.getsockname()) for s in server.sockets)
+        relay = await asyncio.start_server(
+            self.handle, self.args.listen_host, self.args.listen_port, ssl=self.server_ctx)
+        control = await asyncio.start_server(
+            self.handle_control, self.args.listen_host, self.control_port)
         kind = "TLS-terminating MITM" if self.mode == "tls" else "raw TCP relay"
+        addrs = ", ".join(str(s.getsockname()) for s in relay.sockets)
         print(f"[{ts()}] {kind} listening on {addrs}", flush=True)
-        print(f"[{ts()}] forwarding -> {self.args.upstream_ip}:"
-              f"{self.args.upstream_port} (mode={self.mode})", flush=True)
-        print(f"[{ts()}] NOTE: nothing is redirected yet. Point the module here "
-              f"only when you're ready (DNS rewrite or Server Address).", flush=True)
-        async with server:
-            await server.serve_forever()
+        print(f"[{ts()}] forwarding -> {self.args.upstream_ip}:{self.args.upstream_port} (mode={self.mode})", flush=True)
+        print(f"[{ts()}] control server on :{self.control_port} "
+              f"(/status /on /off /inject?hex=)  cmd_on={'set' if self.cmd_on else 'unset'} "
+              f"cmd_off={'set' if self.cmd_off else 'unset'}", flush=True)
+        async with relay, control:
+            await asyncio.gather(relay.serve_forever(), control.serve_forever())
 
 
 def parse_args(argv=None):
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     here = os.path.dirname(os.path.abspath(__file__))
-    p.add_argument("--mode", choices=["raw", "tls"],
-                   default=os.environ.get("PROXY_MODE", DEFAULT_MODE),
-                   help="raw TCP relay (module endpoint) or TLS-terminating MITM")
-    p.add_argument("--listen-host", default=os.environ.get("PROXY_LISTEN_HOST", "0.0.0.0"))
-    p.add_argument("--listen-port", type=int,
-                   default=int(os.environ.get("PROXY_LISTEN_PORT", DEFAULT_LISTEN_PORT)))
-    p.add_argument("--upstream-ip", default=os.environ.get("PROXY_UPSTREAM_IP", DEFAULT_UPSTREAM_IP))
-    p.add_argument("--upstream-port", type=int,
-                   default=int(os.environ.get("PROXY_UPSTREAM_PORT", DEFAULT_UPSTREAM_PORT)))
-    p.add_argument("--upstream-sni", default=os.environ.get("PROXY_UPSTREAM_SNI", DEFAULT_UPSTREAM_SNI))
-    p.add_argument("--cert", default=os.environ.get("PROXY_CERT", os.path.join(here, "certs", "proxy.crt")))
-    p.add_argument("--key", default=os.environ.get("PROXY_KEY", os.path.join(here, "certs", "proxy.key")))
-    p.add_argument("--log-dir", default=os.environ.get("PROXY_LOG_DIR", os.path.join(here, "logs")))
-    p.add_argument("--verify-upstream", action="store_true",
-                   help="(tls mode) verify the real upstream cert (off by default)")
+    env = os.environ.get
+    p.add_argument("--mode", choices=["raw", "tls"], default=env("PROXY_MODE", DEFAULT_MODE))
+    p.add_argument("--listen-host", default=env("PROXY_LISTEN_HOST", "0.0.0.0"))
+    p.add_argument("--listen-port", type=int, default=int(env("PROXY_LISTEN_PORT", DEFAULT_LISTEN_PORT)))
+    p.add_argument("--control-port", type=int, default=int(env("PROXY_CONTROL_PORT", DEFAULT_CONTROL_PORT)))
+    p.add_argument("--upstream-ip", default=env("PROXY_UPSTREAM_IP", DEFAULT_UPSTREAM_IP))
+    p.add_argument("--upstream-port", type=int, default=int(env("PROXY_UPSTREAM_PORT", DEFAULT_UPSTREAM_PORT)))
+    p.add_argument("--upstream-sni", default=env("PROXY_UPSTREAM_SNI", DEFAULT_UPSTREAM_SNI))
+    p.add_argument("--cmd-on", default=env("PROXY_CMD_ON", ""), help="hex frame for power ON")
+    p.add_argument("--cmd-off", default=env("PROXY_CMD_OFF", ""), help="hex frame for power OFF")
+    p.add_argument("--cert", default=env("PROXY_CERT", os.path.join(here, "certs", "proxy.crt")))
+    p.add_argument("--key", default=env("PROXY_KEY", os.path.join(here, "certs", "proxy.key")))
+    p.add_argument("--log-dir", default=env("PROXY_LOG_DIR", os.path.join(here, "logs")))
+    p.add_argument("--verify-upstream", action="store_true")
     return p.parse_args(argv)
 
 
 def main():
     args = parse_args()
     if args.mode == "tls" and not (os.path.exists(args.cert) and os.path.exists(args.key)):
-        sys.exit(f"tls mode needs cert/key ({args.cert} / {args.key}); run gen_cert.sh first")
+        sys.exit(f"tls mode needs cert/key ({args.cert} / {args.key})")
     try:
         asyncio.run(Proxy(args).run())
     except KeyboardInterrupt:

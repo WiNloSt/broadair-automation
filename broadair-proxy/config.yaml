@@ -6,8 +6,8 @@ name: Broad Air Capture Proxy
 version: "1.0.2"
 slug: broadair_proxy
 description: >-
-  Raw TCP relay that captures the Broad "Fresh Lung" purifier module's serial
-  frames (broadair.remotcon.mobi:18013). Log tab shows frames live.
+  Raw TCP relay + local-control for the Broad "Fresh Lung" purifier module
+  (broadair.remotcon.mobi:18013). Captures frames; injects commands via :8099.
 url: https://github.com/WiNloSt/broadair-automation
 # GHCR namespace is your GitHub owner, lowercased. Change if you fork/rename.
 image: "ghcr.io/winlost/broadair-proxy-{arch}"
@@ -18,11 +18,13 @@ arch:
 init: false
 startup: services
 boot: auto
-# The module connects to its Server Port 18013; we listen there and relay.
+# 18013 = the module's Server Port (raw relay). 8099 = local-control HTTP API.
 ports:
   18013/tcp: 18013
+  8099/tcp: 8099
 ports_description:
   18013/tcp: Raw TCP port the Broad WiFi module connects to (broadair.remotcon.mobi:18013)
+  8099/tcp: Local control HTTP API (/status /on /off /inject?hex=)
 # Persistent hex-frame logs land in /share/broadair-proxy (browsable via Samba).
 map:
   - share:rw
@@ -32,9 +34,15 @@ options:
   upstream_ip: "47.110.148.39"
   upstream_port: 18013
   upstream_sni: "broadair.remotcon.mobi"
+  control_port: 8099
+  cmd_on: ""
+  cmd_off: ""
 schema:
   mode: list(raw|tls)
   listen_port: port
   upstream_ip: str
   upstream_port: port
   upstream_sni: str
+  control_port: port
+  cmd_on: str?
+  cmd_off: str?
