@@ -1,0 +1,90 @@
+name: Build and push add-on image
+
+# Every push to main that touches the add-on: bump the version, then build &
+# push a multi-arch image to GHCR tagged with that new version. HA compares the
+# version in config.yaml to what's installed, so the bump is what makes the
+# "Update" button appear.
+on:
+  push:
+    branches: ['main']
+    paths:
+      - 'broadair-proxy/**'
+      - '.github/workflows/build-and-push-image.yaml'
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  # ---- 1. auto-bump the patch version and commit it back --------------------
+  bump:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bump patch version in config.yaml
+        id: bump
+        run: |
+          python3 - <<'PY'
+          import os, re
+          p = "broadair-proxy/config.yaml"
+          s = open(p).read()
+          m = re.search(r'^version:\s*"?(\d+)\.(\d+)\.(\d+)"?', s, re.M)
+          maj, mi, pa = map(int, m.groups())
+          newv = f"{maj}.{mi}.{pa + 1}"
+          s = re.sub(r'^version:.*$', f'version: "{newv}"', s, count=1, flags=re.M)
+          open(p, "w").write(s)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"version={newv}\n")
+          print("new version:", newv)
+          PY
+      - name: Commit bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add broadair-proxy/config.yaml
+          # [skip ci] stops this commit from re-triggering the workflow.
+          git commit -m "ci: bump add-on to ${{ steps.bump.outputs.version }} [skip ci]"
+          git push
+
+  # ---- 2. build one image per arch and push to GHCR -------------------------
+  build:
+    needs: bump
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            platform: linux/arm64
+          - arch: amd64
+            platform: linux/amd64
+          - arch: armv7
+            platform: linux/arm/v7
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lowercase owner for GHCR
+        id: o
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push ${{ matrix.arch }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ./broadair-proxy
+          platforms: ${{ matrix.platform }}
+          push: true
+          tags: |
+            ghcr.io/${{ steps.o.outputs.owner }}/broadair-proxy-${{ matrix.arch }}:${{ needs.bump.outputs.version }}
+            ghcr.io/${{ steps.o.outputs.owner }}/broadair-proxy-${{ matrix.arch }}:latest

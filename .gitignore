@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.env
+dev/certs/
+dev/logs/
+
+# Claude working files / recon — kept local, never shipped
+.claude/
+*.local.md
