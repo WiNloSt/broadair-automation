@@ -3,7 +3,7 @@
 # on the device). The {arch} placeholder is replaced with the host's arch, and
 # HA pulls `<image>:<version>` — so the CI must publish that arch/version tag.
 name: Broad Air Capture Proxy
-version: "1.0.6"
+version: "1.0.7"
 slug: broadair_proxy
 description: >-
   Raw TCP relay + local-control for the Broad "Fresh Lung" purifier module
