@@ -25,8 +25,10 @@ purifier module ──TCP :18013──▶ add-on (on HA) ──TCP──▶ broa
                          HTTP :8099 │ ◀── integration (fan, sensors)
 ```
 
-The add-on holds the module's connection independently of HA Core, so restarting
-or updating HA doesn't drop the purifier's cloud link.
+The module is the TCP client — it "phones home" to whatever Server Address it's
+set to, so pointing it at the HA IP is all that's needed (the add-on never dials
+the purifier). The add-on holds that connection independently of HA Core, so
+restarting HA doesn't drop the purifier's cloud link.
 
 ## Install
 
@@ -34,17 +36,15 @@ or updating HA doesn't drop the purifier's cloud link.
    repo → install **Broad Air Capture Proxy** → start. It auto-learns the device
    address from traffic.
 2. **Redirect the module** — open the module admin page (`http://<module-ip>/`,
-   default `admin`/`admin`) → Other Setting → set **Server Address** to your HA
-   IP, keep **Port** `18013`, save. The module reconnects through the add-on.
-   Reversible: original address is `broadair.remotcon.mobi`. DNS rewrites don't
-   work here — they also catch the phone app and break its login.
+   default `admin` / `admin`) → Other Setting → set **Server Address** to your HA
+   IP, keep **Port** `18013`, save. See the redirect note below for durability.
 3. **Integration** — HACS → custom repository → this repo (type: Integration) →
    install → Settings → Devices & Services → Add → Broad Air Purifier →
    host = your HA IP (or the add-on hostname), port `8099`.
 
 Entities: a **fan** (power, speed Sleep/1/2/3, presets Auto and Normal) plus
-**PM2.5**, **temperature**, and **airflow** sensors. Auto and speed changes made
-from the app or physical remote are reflected too.
+**PM2.5**, **temperature**, and **airflow** sensors. Changes made from the app or
+physical remote are reflected too.
 
 ## Add-on control API (`:8099`)
 
@@ -56,9 +56,8 @@ from the app or physical remote are reflected too.
 - `GET /inject?hex=…` — raw frame
 
 After each command the add-on re-queries the device, so `/status` (and HA) reflect
-the change within about a second. Options: `poll_interval` (status-poll seconds;
-the vendor cloud only polls the device while the app is open, so the add-on polls
-to keep state fresh), `upstream_ip`/`upstream_port`, `mode` (`raw`|`tls`).
+the change within about a second. Options: `poll_interval`, `upstream_ip`/
+`upstream_port`, `mode` (`raw`|`tls`).
 
 ## Protocol
 
@@ -84,7 +83,24 @@ Status dump (device→server, 93 bytes, ctrl `82 51`). Offsets from the `68`:
 | airflow | 58 | m³/h |
 | PM2.5 | 69–70 | 16-bit, µg/m³ |
 | temperature | 87–88 | ÷ 10, °C |
-| filter life | — | candidate byte 39, unconfirmed (needs a real % from the app) |
+| filter totals | 23–24, 25–26 | HEPA 3000 h, coarse 720 h (16-bit) |
+| filter remaining | — | undecoded; a timer reset didn't change the frame |
+
+## Notes / findings
+
+- **Redirect durability.** The Server-Address change only affects the module (not
+  the phone), but the vendor cloud can push a config sync that reverts it back to
+  `broadair.remotcon.mobi` — observed right after resetting a filter in the app.
+  For a permanent redirect use a **router DNAT/firewall rule** (module IP → the HA
+  IP, port 18013); the cloud can't undo that, and the phone stays unaffected.
+- **Not DNS.** A DNS rewrite of `broadair.remotcon.mobi` also redirects the module,
+  but it catches the phone app too and breaks its login. Avoid it.
+- **Cloud polling.** The cloud only queries the device for fresh state while the app
+  is open (every few seconds), and stops when idle — so the add-on polls the device
+  itself (`poll_interval`) to keep HA state current.
+- **Command feedback.** The add-on both re-queries after a command and sniffs the
+  cloud's own commands as they pass through, so app/remote changes show up without
+  waiting for a poll.
 
 ## Dev
 
