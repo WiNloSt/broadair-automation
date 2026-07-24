@@ -33,7 +33,7 @@ class BroadAirCoordinator(DataUpdateCoordinator):
                 resp = await r.json()
         if isinstance(resp, dict) and isinstance(self.data, dict):
             merged = dict(self.data)
-            for key in ("power_on", "fan_m3h"):
+            for key in ("power_on", "fan_m3h", "auto"):
                 if resp.get(key) is not None:
                     merged[key] = resp[key]
             self.async_set_updated_data(merged)

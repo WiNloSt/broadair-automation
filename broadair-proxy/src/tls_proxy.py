@@ -227,9 +227,12 @@ class Proxy:
         st = dict(self.state)
         if b17 == 0x00:                       # power
             st["power_on"] = bool(b22)
-        elif b17 == 0x01:                     # fan level
+        elif b17 == 0x01:                     # fan level (manual)
             st["fan_m3h"] = self._FAN_M3H.get(b22, st.get("fan_m3h"))
             st["power_on"] = True
+            st["auto"] = False
+        elif b17 == 0x0F:                     # auto
+            st["auto"] = True
         else:
             return
         st["updated"] = ts()
@@ -271,6 +274,7 @@ class Proxy:
             "power_on": bool(power),
             "power_raw": power,
             "fan_m3h": data[fs + 58],
+            "auto": data[fs + 48] == 1,
             "temp_c": (data[fs + 87] * 256 + data[fs + 88]) / 10,
             "updated": ts(),
             "raw": data[fs:fs + 93].hex(),
@@ -347,6 +351,7 @@ class Proxy:
                        "have_cmd_off": bool(self.cmd_off),
                        "power_on": self.state["power_on"],
                        "fan_m3h": self.state.get("fan_m3h"),
+                       "auto": self.state.get("auto"),
                        "temp_c": self.state.get("temp_c"),
                        "state_updated": self.state["updated"],
                        "have_addr": self.device_addr is not None,
@@ -395,7 +400,8 @@ class Proxy:
                         await self.refresh_state()
                     payload = {"ok": ok, "action": label, "frame": frame.hex(),
                                "detail": msg, "power_on": self.state.get("power_on"),
-                               "fan_m3h": self.state.get("fan_m3h")}
+                               "fan_m3h": self.state.get("fan_m3h"),
+                               "auto": self.state.get("auto")}
         else:
             status, payload = "404 Not Found", {"ok": False,
                 "detail": "paths: /status /on /off /power?on= /fan?level=0..3 /auto /cmd?b17=&b22= /inject?hex="}
