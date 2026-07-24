@@ -209,7 +209,31 @@ class Proxy:
         if len(data) >= 7 and data[0] == 0x68 and data[1] != 0xAA:
             self.device_addr = data[1:7]
         self._parse_status(data)
+        if direction == "S>C":
+            self._parse_command(data)   # cloud/app-initiated change -> update fast
         return not self._is_routine(data)
+
+    # m³/h for each fan level index
+    _FAN_M3H = {0: 50, 1: 80, 2: 120, 3: 180}
+
+    def _parse_command(self, data: bytes):
+        """A state command from the cloud (app or remote): 86 02 0f | 01 10 00
+        b17 00 01 02 00 b22. Update state optimistically so HA reflects changes
+        made outside HA without waiting for the next poll."""
+        i = data.find(b"\x86\x02\x0f")
+        if i < 0 or i + 15 >= len(data) or data[i + 7:i + 9] != b"\x01\x10":
+            return
+        b17, b22 = data[i + 10], data[i + 15]
+        st = dict(self.state)
+        if b17 == 0x00:                       # power
+            st["power_on"] = bool(b22)
+        elif b17 == 0x01:                     # fan level
+            st["fan_m3h"] = self._FAN_M3H.get(b22, st.get("fan_m3h"))
+            st["power_on"] = True
+        else:
+            return
+        st["updated"] = ts()
+        self.state = st
 
     def build_cmd(self, b17: int, b22: int):
         """Synthesize a command frame: 68|addr|86 02 0f 03 00 00 08|

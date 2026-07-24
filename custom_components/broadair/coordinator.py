@@ -12,7 +12,7 @@ class BroadAirCoordinator(DataUpdateCoordinator):
 
     def __init__(self, hass, host, port):
         super().__init__(hass, LOGGER, name=DOMAIN,
-                         update_interval=timedelta(seconds=10))
+                         update_interval=timedelta(seconds=5))
         self._base = f"http://{host}:{port}"
         self._session = async_get_clientsession(hass)
 
