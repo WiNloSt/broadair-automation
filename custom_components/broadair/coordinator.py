@@ -25,7 +25,15 @@ class BroadAirCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(err) from err
 
     async def command(self, path):
-        """GET a control endpoint (e.g. /fan?level=2) then refresh."""
+        """GET a control endpoint (e.g. /fan?level=2). The add-on re-queries the
+        device before replying, so use the fresh values in the response to update
+        entities immediately instead of waiting for the next poll."""
         async with async_timeout.timeout(8):
-            await self._session.get(f"{self._base}{path}")
-        await self.async_request_refresh()
+            async with self._session.get(f"{self._base}{path}") as r:
+                resp = await r.json()
+        if isinstance(resp, dict) and isinstance(self.data, dict):
+            merged = dict(self.data)
+            for key in ("power_on", "fan_m3h"):
+                if resp.get(key) is not None:
+                    merged[key] = resp[key]
+            self.async_set_updated_data(merged)
