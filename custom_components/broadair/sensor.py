@@ -10,6 +10,7 @@ from .const import DOMAIN
 
 # key, name, device_class, unit
 SENSORS = [
+    ("pm25", "PM2.5", SensorDeviceClass.PM25, "µg/m³"),
     ("temp_c", "Temperature", SensorDeviceClass.TEMPERATURE, UnitOfTemperature.CELSIUS),
     ("fan_m3h", "Airflow", None, "m³/h"),
 ]
