@@ -61,6 +61,15 @@ def parse_hex(s: str) -> bytes:
         return b""
 
 
+def crc16_modbus(data: bytes) -> int:
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc
+
+
 class Logger:
     def __init__(self, conn_id, log_dir):
         self.conn_id = conn_id
@@ -134,6 +143,10 @@ class Proxy:
         self.ctrl_log = Logger("control", args.log_dir)
         # parsed device state (from the 93-byte status dump)
         self.state = {"power_on": None, "updated": None, "raw": None}
+        # device address (MAC reversed) — learned from traffic, or seeded from cmd_on
+        self.device_addr = None
+        if len(self.cmd_on) >= 7 and self.cmd_on[0] == 0x68:
+            self.device_addr = self.cmd_on[1:7]
 
         self.server_ctx = None
         self.client_ctx = None
@@ -192,8 +205,23 @@ class Proxy:
         """Parse state (side effect); return True if this chunk should be logged.
         Routine polls/heartbeats/status frames are suppressed to keep the log
         focused on real commands even when polling fast."""
+        # learn the device address from any non-broadcast framed message
+        if len(data) >= 7 and data[0] == 0x68 and data[1] != 0xAA:
+            self.device_addr = data[1:7]
         self._parse_status(data)
         return not self._is_routine(data)
+
+    def build_cmd(self, b17: int, b22: int):
+        """Synthesize a command frame: 68|addr|86 02 0f 03 00 00 08|
+        01 10 00 b17 00 01 02 00 b22|CRC16-modbus|sum|16."""
+        if self.device_addr is None:
+            return None
+        inner = bytes([0x01, 0x10, 0x00, b17 & 0xFF, 0x00, 0x01, 0x02, 0x00, b22 & 0xFF])
+        crc = crc16_modbus(inner)
+        body = (bytes([0x68]) + self.device_addr
+                + bytes([0x86, 0x02, 0x0F, 0x03, 0x00, 0x00, 0x08])
+                + inner + bytes([crc & 0xFF, (crc >> 8) & 0xFF]))
+        return body + bytes([sum(body) & 0xFF, 0x16])
 
     @staticmethod
     def _is_routine(d):
@@ -210,14 +238,18 @@ class Proxy:
         idx = data.find(b"\x86\x82\x51")   # 86 at frame offset 7 -> byte18 = idx+11
         if idx < 0 or idx + 11 >= len(data):
             return
-        frame_start = idx - 7
-        power = data[idx + 11]
+        fs = idx - 7          # frame start
+        if fs < 0 or fs + 93 > len(data):
+            return
+        power = data[fs + 18]
         prev = self.state.get("power_on")
         self.state = {
             "power_on": bool(power),
             "power_raw": power,
+            "fan_m3h": data[fs + 58],
+            "temp_c": (data[fs + 87] * 256 + data[fs + 88]) / 10,
             "updated": ts(),
-            "raw": data[frame_start:frame_start + 93].hex(),
+            "raw": data[fs:fs + 93].hex(),
         }
         if prev is not None and prev != bool(power):
             print(f"[{ts()}] [state] power {'on' if prev else 'off'} -> "
@@ -271,7 +303,10 @@ class Proxy:
                        "have_cmd_on": bool(self.cmd_on),
                        "have_cmd_off": bool(self.cmd_off),
                        "power_on": self.state["power_on"],
+                       "fan_m3h": self.state.get("fan_m3h"),
+                       "temp_c": self.state.get("temp_c"),
                        "state_updated": self.state["updated"],
+                       "have_addr": self.device_addr is not None,
                        "raw": self.state.get("raw")}
         elif u.path in ("/on", "/off"):
             frame = self.cmd_on if u.path == "/on" else self.cmd_off
@@ -287,8 +322,36 @@ class Proxy:
             else:
                 ok, msg = await self.inject(frame)
                 payload = {"ok": ok, "detail": msg}
+        elif u.path in ("/fan", "/auto", "/power", "/cmd"):
+            # synthesized commands (need the learned device address)
+            if u.path == "/fan":
+                lvl = int(q.get("level", ["-1"])[0]) if q.get("level", [""])[0].lstrip("-").isdigit() else -1
+                b17, b22, label = 0x01, lvl, f"fan level {lvl}"
+                if not (0 <= lvl <= 3):
+                    status, payload = "400 Bad Request", {"ok": False, "detail": "level must be 0..3"}
+                    b17 = None
+            elif u.path == "/auto":
+                b17, b22, label = 0x0F, 0x01, "auto"
+            elif u.path == "/power":
+                on = q.get("on", ["1"])[0].lower() in ("1", "true", "on", "yes")
+                b17, b22, label = 0x00, 1 if on else 0, f"power {'on' if on else 'off'}"
+            else:  # /cmd?b17=&b22=
+                try:
+                    b17 = int(q.get("b17", ["0"])[0], 0); b22 = int(q.get("b22", ["0"])[0], 0)
+                    label = f"cmd b17={b17} b22={b22}"
+                except ValueError:
+                    status, payload = "400 Bad Request", {"ok": False, "detail": "b17/b22 must be ints"}
+                    b17 = None
+            if b17 is not None and status == "200 OK":
+                frame = self.build_cmd(b17, b22)
+                if frame is None:
+                    status, payload = "409 Conflict", {"ok": False, "detail": "device address not learned yet"}
+                else:
+                    ok, msg = await self.inject(frame)
+                    payload = {"ok": ok, "action": label, "frame": frame.hex(), "detail": msg}
         else:
-            status, payload = "404 Not Found", {"ok": False, "detail": "paths: /status /on /off /inject?hex="}
+            status, payload = "404 Not Found", {"ok": False,
+                "detail": "paths: /status /on /off /power?on= /fan?level=0..3 /auto /cmd?b17=&b22= /inject?hex="}
 
         body = json.dumps(payload)
         resp = (f"HTTP/1.1 {status}\r\nContent-Type: application/json\r\n"
