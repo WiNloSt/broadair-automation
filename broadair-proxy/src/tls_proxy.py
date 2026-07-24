@@ -270,6 +270,25 @@ class Proxy:
                 except OSError:
                     pass
 
+    async def refresh_state(self):
+        """After a command, re-query the device so /status reflects it fast."""
+        if not self.status_query:
+            return
+        before = self.state.get("updated")
+        await asyncio.sleep(0.25)   # let the device apply the command first
+        w = self.module_writer
+        if w is not None and not w.is_closing():
+            try:
+                async with self.module_lock:
+                    w.write(self.status_query)
+                    await w.drain()
+            except OSError:
+                return
+        for _ in range(16):         # wait up to ~0.8s for the fresh dump
+            await asyncio.sleep(0.05)
+            if self.state.get("updated") != before:
+                return
+
     # ---- injection ----------------------------------------------------------
     async def inject(self, frame: bytes):
         if not frame:
@@ -348,7 +367,11 @@ class Proxy:
                     status, payload = "409 Conflict", {"ok": False, "detail": "device address not learned yet"}
                 else:
                     ok, msg = await self.inject(frame)
-                    payload = {"ok": ok, "action": label, "frame": frame.hex(), "detail": msg}
+                    if ok:
+                        await self.refresh_state()
+                    payload = {"ok": ok, "action": label, "frame": frame.hex(),
+                               "detail": msg, "power_on": self.state.get("power_on"),
+                               "fan_m3h": self.state.get("fan_m3h")}
         else:
             status, payload = "404 Not Found", {"ok": False,
                 "detail": "paths: /status /on /off /power?on= /fan?level=0..3 /auto /cmd?b17=&b22= /inject?hex="}
