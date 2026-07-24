@@ -1,0 +1,12 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Broad Air Purifier",
+        "description": "Point this at the Broad Air Capture Proxy add-on (its :8099 control API).",
+        "data": { "host": "Host", "port": "Port" }
+      }
+    },
+    "abort": { "already_configured": "This proxy is already configured" }
+  }
+}
